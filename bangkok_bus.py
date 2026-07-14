@@ -5,14 +5,19 @@ Predicts passenger demand & travel times from traffic + historical ridership,
 then optimises dynamic bus frequency under EV battery constraints and
 quantifies fuel/electricity, fleet, labour, ridership, and revenue impact.
 
+Network/ridership/traffic prefer real Namtang GTFS + OSM + MOT + Google/ORS
+(see data/); falls back to synthetic corridors if cache/build fails.
+
 Run:
     python bangkok_bus.py
+    python -m data.build_dataset
 """
 
 from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -25,12 +30,11 @@ warnings.filterwarnings("ignore", category=UserWarning)
 RNG = np.random.default_rng(42)
 
 # ---------------------------------------------------------------------------
-# 1. Synthetic Bangkok-like network data
-#    Inspired by BMTA corridor patterns (rush-hour peaks, corridor congestion)
+# 1. Network data — real BMTA corridors (GTFS/OSM/MOT) with synthetic fallback
 # ---------------------------------------------------------------------------
 
-ROUTES = [
-    # route_id, length_km, stops, base_demand/hour, fare_thb, diesel_l_per_km
+# Tuple: route_id, length_km, stops, base_demand/hour, fare_thb, diesel_l_per_km
+SYNTHETIC_ROUTES = [
     ("R8", 22.0, 28, 180, 15.0, 0.42),
     ("R29", 18.5, 24, 160, 14.0, 0.40),
     ("R39", 26.0, 32, 210, 16.0, 0.45),
@@ -38,12 +42,80 @@ ROUTES = [
     ("R554", 30.0, 36, 120, 18.0, 0.48),
 ]
 
+ROUTES: list[tuple] = list(SYNTHETIC_ROUTES)
+ROUTE_RECORDS: list[dict[str, Any]] = []
+DATA_SOURCES: dict[str, Any] = {
+    "mode": "synthetic",
+    "note": "Using synthetic fallback until real dataset is built.",
+}
+_TRAFFIC_PROFILES: dict[str, Any] | None = None
+
 HOURS = list(range(5, 23))  # 05:00–22:00 operating day
 
 
-def bangkok_traffic_index(hour: int, day_of_week: int) -> float:
-    """Traffic congestion index ~0.4 (free flow) to ~1.6 (severe jam)."""
-    # Weekday morning/evening peaks (typical Bangkok CBD corridors)
+def _records_to_tuples(records: list[dict[str, Any]]) -> list[tuple]:
+    out = []
+    for r in records:
+        out.append(
+            (
+                r["route_id"],
+                float(r["length_km"]),
+                int(r["n_stops"]),
+                int(r["base_demand"]),
+                float(r["fare_thb"]),
+                float(r["diesel_l_per_km"]),
+            )
+        )
+    return out
+
+
+def load_real_network(force: bool = False) -> bool:
+    """Load Namtang GTFS + OSM + MOT dataset into ROUTES. Returns True on success."""
+    global ROUTES, ROUTE_RECORDS, DATA_SOURCES, _TRAFFIC_PROFILES
+    try:
+        from data.build_dataset import ensure_dataset
+        from data.traffic import TRAFFIC_CACHE
+        import json
+
+        ds = ensure_dataset(force=force)
+        records = ds["routes"]
+        if not records:
+            return False
+        ROUTES = _records_to_tuples(records)
+        ROUTE_RECORDS = records
+        meta = ds.get("meta") or {}
+        DATA_SOURCES = {
+            "mode": "real",
+            "sources": meta.get("sources", {}),
+            "mot_month": meta.get("mot_month"),
+            "traffic_provider": meta.get("traffic_provider"),
+            "disclaimer": meta.get("disclaimer"),
+            "routes": [r["route_id"] for r in records],
+            "n_historical_rows": meta.get("n_rows"),
+        }
+        if TRAFFIC_CACHE.exists():
+            with open(TRAFFIC_CACHE, encoding="utf-8") as f:
+                _TRAFFIC_PROFILES = json.load(f)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"Real network load failed ({exc}); keeping synthetic ROUTES.")
+        DATA_SOURCES = {
+            "mode": "synthetic",
+            "error": str(exc),
+            "note": "Fell back to synthetic BMTA-style corridors.",
+        }
+        return False
+
+
+def bangkok_traffic_index(hour: int, day_of_week: int, route_id: str | None = None) -> float:
+    """Traffic congestion index ~0.4 (free flow) to ~2.0 (severe jam)."""
+    if _TRAFFIC_PROFILES and route_id:
+        try:
+            from data.traffic import traffic_index_for
+
+            return traffic_index_for(_TRAFFIC_PROFILES, route_id, hour, day_of_week, 0.0)
+        except Exception:
+            pass
     if day_of_week < 5:
         if 7 <= hour <= 9:
             return 1.45 + 0.15 * np.sin((hour - 7) * np.pi / 2)
@@ -52,7 +124,6 @@ def bangkok_traffic_index(hour: int, day_of_week: int) -> float:
         if 11 <= hour <= 13:
             return 1.05
         return 0.75
-    # Weekend: milder mid-day hump
     if 10 <= hour <= 18:
         return 1.10
     return 0.65
@@ -75,30 +146,28 @@ def bangkok_demand_multiplier(hour: int, day_of_week: int) -> float:
     return 0.40
 
 
-def generate_historical_data(n_days: int = 60) -> pd.DataFrame:
-    """Simulate 60 days of route × hour observations with traffic & ridership."""
+def _generate_synthetic_historical(n_days: int = 60) -> pd.DataFrame:
+    """Legacy synthetic panel (fallback)."""
     rows = []
     for day in range(n_days):
         dow = day % 7
-        rain = float(RNG.random() < 0.18)  # ~18% rainy days in Bangkok wet periods
+        rain = float(RNG.random() < 0.18)
         for hour in HOURS:
-            traffic = bangkok_traffic_index(hour, dow)
-            # Rain worsens congestion
-            traffic *= 1.0 + 0.22 * rain
-            traffic += float(RNG.normal(0, 0.05))
-            traffic = float(np.clip(traffic, 0.4, 2.0))
-
-            demand_mult = bangkok_demand_multiplier(hour, dow)
-            demand_mult *= 1.0 - 0.12 * rain  # rain slightly reduces bus demand
-            demand_mult += float(RNG.normal(0, 0.08))
-            demand_mult = float(np.clip(demand_mult, 0.2, 2.2))
-
             for route_id, length_km, stops, base_dem, fare, diesel in ROUTES:
+                traffic = bangkok_traffic_index(hour, dow, route_id)
+                traffic *= 1.0 + 0.22 * rain
+                traffic += float(RNG.normal(0, 0.05))
+                traffic = float(np.clip(traffic, 0.4, 2.0))
+
+                demand_mult = bangkok_demand_multiplier(hour, dow)
+                demand_mult *= 1.0 - 0.12 * rain
+                demand_mult += float(RNG.normal(0, 0.08))
+                demand_mult = float(np.clip(demand_mult, 0.2, 2.2))
+
                 passengers = max(
                     0,
                     int(base_dem * demand_mult * (1 + float(RNG.normal(0, 0.06)))),
                 )
-                # Travel time: free-flow ~2.1 min/km, scales with traffic + dwell
                 free_flow_min = length_km * 2.1
                 dwell_min = stops * 0.35 * (0.8 + 0.4 * (passengers / (base_dem + 1)))
                 travel_min = (free_flow_min * traffic) + dwell_min + float(
@@ -123,6 +192,26 @@ def generate_historical_data(n_days: int = 60) -> pd.DataFrame:
                     }
                 )
     return pd.DataFrame(rows)
+
+
+def generate_historical_data(n_days: int = 60) -> pd.DataFrame:
+    """
+    Prefer real cached panel (MOT-calibrated demand + traffic profiles + Open-Meteo rain).
+    Falls back to synthetic if real dataset unavailable.
+    """
+    try:
+        from data.build_dataset import ensure_dataset
+
+        if not ROUTE_RECORDS:
+            load_real_network()
+        ds = ensure_dataset()
+        hist = ds.get("historical")
+        if hist is not None and len(hist) > 100:
+            DATA_SOURCES["mode"] = DATA_SOURCES.get("mode") or "real"
+            return hist
+    except Exception as e:  # noqa: BLE001
+        print(f"Real historical unavailable ({e}); using synthetic.")
+    return _generate_synthetic_historical(n_days)
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +290,11 @@ def predict_horizon(
     rows = []
     route_map = {r[0]: i for i, r in enumerate(ROUTES)}
     for hour in HOURS:
-        traffic = bangkok_traffic_index(hour, day_of_week) * (1 + 0.22 * rain)
         for route_id, length_km, stops, *_rest in ROUTES:
+            traffic = bangkok_traffic_index(hour, day_of_week, route_id) * (
+                1 + 0.22 * rain
+            )
+            traffic = float(np.clip(traffic, 0.4, 2.5))
             feat = pd.DataFrame(
                 [
                     {
@@ -586,8 +678,11 @@ def main() -> None:
     print("Stack:   ML demand/travel models → EV-constrained frequency optimiser")
     print("         → quantified ops & revenue impact")
 
+    load_real_network()
+    print(f"Data mode: {DATA_SOURCES.get('mode')} | {DATA_SOURCES.get('sources') or DATA_SOURCES.get('note')}")
+
     # --- Data ---
-    print_section("1. Historical data (synthetic BMTA-style corridors)")
+    print_section("1. Historical data (BMTA GTFS / MOT / traffic)")
     hist = generate_historical_data(60)
     print(f"Observations: {len(hist):,}  |  Routes: {len(ROUTES)}  |  Days: 60")
     print(hist.groupby("route_id")[["passengers", "travel_time_min"]].mean().round(1))
@@ -605,8 +700,11 @@ def main() -> None:
     )
 
     forecast = predict_horizon(models, day_of_week=1, rain=0.0)  # Tuesday dry
-    print("\nSample forecast (Route R39, peak hours):")
-    sample = forecast[(forecast.route_id == "R39") & (forecast.hour.isin([8, 12, 18]))]
+    sample_route = ROUTES[0][0]
+    print(f"\nSample forecast (Route {sample_route}, peak hours):")
+    sample = forecast[
+        (forecast.route_id == sample_route) & (forecast.hour.isin([8, 12, 18]))
+    ]
     print(sample.to_string(index=False))
 
     # --- Optimisation ---
@@ -626,10 +724,10 @@ def main() -> None:
     print(f"Average load factor: {opt_sum['avg_load_factor']:.2f}")
     print(f"Total vehicle-trips scheduled: {opt_sum['total_vehicle_trips']}")
 
-    print("\nDynamic vs fixed frequency — Route R8:")
+    print(f"\nDynamic vs fixed frequency — Route {sample_route}:")
     print(f"{'Hour':>4}  {'Demand':>7}  {'Fixed':>5}  {'AI+EV':>5}  {'Load':>5}")
     for p in plans:
-        if p.route_id != "R8":
+        if p.route_id != sample_route:
             continue
         fixed = baseline_frequency(p.hour)
         print(

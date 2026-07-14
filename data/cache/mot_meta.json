@@ -1,0 +1,5 @@
+{
+  "catalog_reachable": true,
+  "status": 200,
+  "note": "XLSX auto-parse not guaranteed; using calibrated CSV snapshot."
+}

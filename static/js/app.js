@@ -232,10 +232,37 @@ function renderImpact() {
   `;
 }
 
+function setProvenance(ds) {
+  const el = $("provenance");
+  const badge = $("dataBadge");
+  if (!ds) return;
+
+  const isReal = ds.mode === "real";
+  if (badge) {
+    badge.className = `data-badge ${isReal ? "real" : "synthetic"}`;
+    badge.textContent = isReal ? "Real data" : "Synthetic";
+    badge.title = isReal
+      ? "Using Namtang GTFS, OSM, MOT ridership, and traffic profiles"
+      : ds.note || ds.error || "Fell back to synthetic corridors";
+  }
+
+  if (!el) return;
+  if (isReal && ds.sources) {
+    const s = ds.sources;
+    const traffic = ds.traffic_provider || "heuristic";
+    const month = ds.mot_month ? ` · MOT ${ds.mot_month}` : "";
+    el.textContent = `Namtang GTFS · OSM · ${traffic} traffic${month}`;
+    el.title = ds.disclaimer || s.ridership || "";
+  } else {
+    el.textContent = ds.note || "Synthetic fallback (run: python -m data.build_dataset)";
+  }
+}
+
 async function waitForModels() {
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < 120; i++) {
     const res = await fetch("/api/health");
     const data = await res.json();
+    if (data.data_sources) setProvenance(data.data_sources);
     if (data.ready) {
       setStatus("Models ready", "ready");
       return true;
@@ -244,8 +271,8 @@ async function waitForModels() {
       setStatus(data.error, "error");
       return false;
     }
-    setStatus("Training models…");
-    await new Promise((r) => setTimeout(r, 800));
+    setStatus("Loading GTFS / training models…");
+    await new Promise((r) => setTimeout(r, 1000));
   }
   setStatus("Timed out waiting for models", "error");
   return false;
@@ -268,6 +295,7 @@ async function runOptimise(e) {
       throw new Error(err.error || `HTTP ${res.status}`);
     }
     state.data = await res.json();
+    if (state.data.data_sources) setProvenance(state.data.data_sources);
     state.hour = Number($("hour").value);
     renderLegend(state.data.routes);
     renderRouteList();
@@ -277,7 +305,7 @@ async function runOptimise(e) {
 
     const bounds = L.latLngBounds([]);
     state.data.routes.forEach((r) => {
-      r.path.forEach(([lat, lon]) => bounds.extend([lat, lon]));
+      (r.path || []).forEach(([lat, lon]) => bounds.extend([lat, lon]));
     });
     if (bounds.isValid()) {
       state.map.fitBounds(bounds, { padding: [30, 30] });

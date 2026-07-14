@@ -1,0 +1,23 @@
+{
+  "built_at": "2026-07-14T18:14:03.489590+00:00",
+  "n_rows": 5400,
+  "n_routes": 5,
+  "routes": [
+    "R2-38",
+    "R1-1",
+    "R1-5",
+    "R4-60",
+    "RS2"
+  ],
+  "mot_month": "2025-06",
+  "mot_daily_system_boardings": 1046153.8461538461,
+  "traffic_provider": "heuristic",
+  "sources": {
+    "network": "Namtang GTFS (OTP Thailand)",
+    "geometry": "GTFS shapes + OpenStreetMap Overpass",
+    "ridership": "MOT BMTA monthly totals (disaggregated)",
+    "traffic": "Google TRAFFIC_AWARE when GOOGLE_MAPS_API_KEY set; else OpenRouteService if ORS_API_KEY; else Bangkok heuristic index.",
+    "weather": "Open-Meteo Bangkok precipitation"
+  },
+  "disclaimer": "MOT monthly system totals disaggregated to corridors by GTFS trip×stop weights — not live per-route APC."
+}

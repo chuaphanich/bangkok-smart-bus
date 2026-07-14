@@ -15,89 +15,6 @@ import bangkok_bus as bb
 
 app = Flask(__name__)
 
-# Approximate BMTA-style corridor polylines (lat, lon) for map display
-ROUTE_GEOMETRY: dict[str, dict[str, Any]] = {
-    "R8": {
-        "name": "Victory Monument → Bang Sue",
-        "color": "#E85D04",
-        "path": [
-            [13.7649, 100.5383],
-            [13.7705, 100.5401],
-            [13.7790, 100.5450],
-            [13.7865, 100.5488],
-            [13.7940, 100.5520],
-            [13.8025, 100.5545],
-            [13.8120, 100.5568],
-            [13.8205, 100.5530],
-            [13.8280, 100.5475],
-            [13.8355, 100.5410],
-        ],
-    },
-    "R29": {
-        "name": "Siam → Lat Phrao",
-        "color": "#2A9D8F",
-        "path": [
-            [13.7460, 100.5340],
-            [13.7495, 100.5395],
-            [13.7545, 100.5445],
-            [13.7620, 100.5510],
-            [13.7700, 100.5565],
-            [13.7785, 100.5620],
-            [13.7880, 100.5685],
-            [13.7965, 100.5740],
-            [13.8050, 100.5805],
-            [13.8125, 100.5860],
-        ],
-    },
-    "R39": {
-        "name": "Silom → Ratchadapisek",
-        "color": "#4C6EF5",
-        "path": [
-            [13.7240, 100.5280],
-            [13.7285, 100.5325],
-            [13.7350, 100.5380],
-            [13.7420, 100.5435],
-            [13.7490, 100.5490],
-            [13.7565, 100.5555],
-            [13.7650, 100.5620],
-            [13.7740, 100.5685],
-            [13.7830, 100.5750],
-            [13.7915, 100.5810],
-            [13.8000, 100.5865],
-        ],
-    },
-    "R509": {
-        "name": "Tha Phra → MBK",
-        "color": "#D62828",
-        "path": [
-            [13.7305, 100.4700],
-            [13.7320, 100.4805],
-            [13.7340, 100.4910],
-            [13.7365, 100.5010],
-            [13.7395, 100.5105],
-            [13.7425, 100.5195],
-            [13.7450, 100.5265],
-            [13.7465, 100.5325],
-        ],
-    },
-    "R554": {
-        "name": "Din Daeng → Min Buri",
-        "color": "#9B5DE5",
-        "path": [
-            [13.7690, 100.5530],
-            [13.7725, 100.5650],
-            [13.7760, 100.5780],
-            [13.7800, 100.5920],
-            [13.7850, 100.6080],
-            [13.7905, 100.6250],
-            [13.7960, 100.6420],
-            [13.8020, 100.6580],
-            [13.8085, 100.6750],
-            [13.8135, 100.6900],
-        ],
-    },
-}
-
 _state: dict[str, Any] = {
     "models": None,
     "ready": False,
@@ -107,19 +24,52 @@ _state: dict[str, Any] = {
 
 def _bootstrap() -> None:
     try:
+        print("Loading real BMTA/OSM/MOT/traffic network…")
+        ok = bb.load_real_network()
+        if not ok:
+            print("Warning: real network unavailable — synthetic fallback.")
         hist = bb.generate_historical_data(60)
         models = bb.train_models(hist)
         _state["models"] = models
         _state["ready"] = True
+        print(f"Ready. Data mode={bb.DATA_SOURCES.get('mode')}")
     except Exception as exc:  # noqa: BLE001 — surface to UI
         _state["error"] = str(exc)
         _state["ready"] = False
 
 
 def _route_meta() -> list[dict[str, Any]]:
+    if bb.ROUTE_RECORDS:
+        out = []
+        for r in bb.ROUTE_RECORDS:
+            out.append(
+                {
+                    "route_id": r["route_id"],
+                    "name": r.get("name", r["route_id"]),
+                    "color": r.get("color", "#888"),
+                    "path": r.get("path", []),
+                    "length_km": r["length_km"],
+                    "n_stops": r["n_stops"],
+                    "base_demand": r["base_demand"],
+                    "fare_thb": r["fare_thb"],
+                    "diesel_l_per_km": r["diesel_l_per_km"],
+                    "shape_source": r.get("shape_source"),
+                    "daily_boardings_prior": r.get("daily_boardings_prior"),
+                }
+            )
+        return out
+
+    # Synthetic geometry fallback (same as legacy)
+    fallback_geo = {
+        "R8": {"name": "Victory Monument → Bang Sue", "color": "#E85D04", "path": [[13.7649, 100.5383], [13.8355, 100.5410]]},
+        "R29": {"name": "Siam → Lat Phrao", "color": "#2A9D8F", "path": [[13.7460, 100.5340], [13.8125, 100.5860]]},
+        "R39": {"name": "Silom → Ratchadapisek", "color": "#4C6EF5", "path": [[13.7240, 100.5280], [13.8000, 100.5865]]},
+        "R509": {"name": "Tha Phra → MBK", "color": "#D62828", "path": [[13.7305, 100.4700], [13.7465, 100.5325]]},
+        "R554": {"name": "Din Daeng → Min Buri", "color": "#9B5DE5", "path": [[13.7690, 100.5530], [13.8135, 100.6900]]},
+    }
     out = []
     for route_id, length_km, stops, base_dem, fare, diesel in bb.ROUTES:
-        geo = ROUTE_GEOMETRY.get(route_id, {})
+        geo = fallback_geo.get(route_id, {})
         out.append(
             {
                 "route_id": route_id,
@@ -230,6 +180,7 @@ def _run_optimisation(
             "fleet_size": fleet_size,
         },
         "ev": asdict(bb.EV),
+        "data_sources": bb.DATA_SOURCES,
     }
 
 
@@ -244,6 +195,7 @@ def health():
         {
             "ready": _state["ready"],
             "error": _state["error"],
+            "data_sources": bb.DATA_SOURCES,
         }
     )
 
@@ -268,7 +220,7 @@ def optimise():
 
 
 if __name__ == "__main__":
-    print("Training demand & travel models (first run)…")
+    print("Bootstrapping Bangkok Smart Bus…")
     _bootstrap()
     if _state["ready"]:
         print("Models ready. Open http://127.0.0.1:5050")
