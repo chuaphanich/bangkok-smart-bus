@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bangkok Smart Bus</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Sora:wght@500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+  <div id="app">
+    <aside class="panel" id="panel">
+      <header class="brand">
+        <p class="brand-mark">BMTA · AI dispatch</p>
+        <h1>Bangkok Smart Bus</h1>
+        <p class="tagline">EV frequency that follows demand across five corridors.</p>
+      </header>
+
+      <form class="controls" id="controls">
+        <label>
+          <span>Day</span>
+          <select name="day_of_week" id="day">
+            <option value="0">Monday</option>
+            <option value="1" selected>Tuesday</option>
+            <option value="2">Wednesday</option>
+            <option value="3">Thursday</option>
+            <option value="4">Friday</option>
+            <option value="5">Saturday</option>
+            <option value="6">Sunday</option>
+          </select>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="rain" />
+          <span>Rain day</span>
+        </label>
+        <label>
+          <span>Fleet size</span>
+          <input type="range" id="fleet" min="60" max="160" step="5" value="110" />
+          <em id="fleetVal">110</em>
+        </label>
+        <button type="submit" id="runBtn">Run optimiser</button>
+      </form>
+
+      <section class="hour-block">
+        <div class="hour-head">
+          <span>Hour on map</span>
+          <strong id="hourLabel">08:00</strong>
+        </div>
+        <input type="range" id="hour" min="5" max="22" step="1" value="8" />
+      </section>
+
+      <section class="routes" id="routeList" aria-label="Routes"></section>
+
+      <section class="metrics" id="metrics">
+        <p class="muted">Run the optimiser to see predictions on the map.</p>
+      </section>
+
+      <section class="impact" id="impact" hidden></section>
+      <section class="recs" id="recs" hidden></section>
+    </aside>
+
+    <main class="map-wrap">
+      <div id="map"></div>
+      <div class="map-legend" id="legend"></div>
+      <div class="status" id="status">Loading models…</div>
+    </main>
+  </div>
+
+  <div class="loading" id="loading" hidden>
+    <div class="spinner"></div>
+    <p>Training models &amp; optimising dispatch…</p>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
