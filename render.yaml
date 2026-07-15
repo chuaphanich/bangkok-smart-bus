@@ -6,7 +6,7 @@ services:
     name: bangkok-smart-bus
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements_bangkok_bus.txt
+    buildCommand: pip install -r requirements.txt
     startCommand: gunicorn -b 0.0.0.0:$PORT -w 1 --timeout 180 --access-logfile - app:app
     healthCheckPath: /api/health
     envVars:
