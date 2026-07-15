@@ -17,13 +17,17 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
+
+MODELS_CACHE = Path(__file__).resolve().parent / "data" / "cache" / "models.joblib"
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -281,6 +285,50 @@ def train_models(df: pd.DataFrame) -> PredictionModels:
     )
 
 
+def save_models(models: PredictionModels, path: Path | None = None) -> Path:
+    """Persist trained models for fast cold starts (Render / Docker)."""
+    dest = path or MODELS_CACHE
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(
+        {
+            "demand_model": models.demand_model,
+            "travel_model": models.travel_model,
+            "demand_mae": models.demand_mae,
+            "demand_r2": models.demand_r2,
+            "travel_mae": models.travel_mae,
+            "travel_r2": models.travel_r2,
+            "route_ids": [r[0] for r in ROUTES],
+        },
+        dest,
+    )
+    return dest
+
+
+def load_models(path: Path | None = None) -> PredictionModels | None:
+    """Load cached models if present and route set still matches."""
+    src = path or MODELS_CACHE
+    if not src.exists():
+        return None
+    try:
+        blob = joblib.load(src)
+        cached_routes = blob.get("route_ids") or []
+        current = [r[0] for r in ROUTES]
+        if cached_routes and cached_routes != current:
+            print("Cached models route set differs — will retrain.")
+            return None
+        return PredictionModels(
+            demand_model=blob["demand_model"],
+            travel_model=blob["travel_model"],
+            demand_mae=float(blob["demand_mae"]),
+            demand_r2=float(blob["demand_r2"]),
+            travel_mae=float(blob["travel_mae"]),
+            travel_r2=float(blob["travel_r2"]),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Could not load model cache ({exc}); will retrain.")
+        return None
+
+
 def predict_horizon(
     models: PredictionModels,
     day_of_week: int = 1,
@@ -332,11 +380,17 @@ class EVBusSpec:
     energy_kwh_per_km: float = 1.35  # loaded urban BEB typical range
     min_soc: float = 0.20  # keep 20% reserve
     charge_kw: float = 150.0  # depot DC fast charge
+    # BMTA 10–12 m EV/AC TOR: seated ≥31; crush load modelled at 60
     bus_capacity: int = 60
     max_hours_shift: float = 8.0
 
 
-EV = EVBusSpec()
+try:
+    from data.thai_assumptions import BMTA_BUS_CAPACITY as _BMTA_CAP
+
+    EV = EVBusSpec(bus_capacity=int(_BMTA_CAP))
+except Exception:
+    EV = EVBusSpec()
 
 
 @dataclass
@@ -370,30 +424,33 @@ def is_peak_hour(hour: int) -> bool:
     return (6 <= hour <= 9) or (16 <= hour <= 19)
 
 
-def optimise_frequencies(
+def _buses_for_freq(freq: int, cycle_h: float) -> int:
+    """Concurrent buses needed for a continuous loop at this frequency."""
+    if freq <= 0:
+        return 0
+    return max(1, int(np.ceil(freq * cycle_h)))
+
+
+def allocate_frequencies(
     forecast: pd.DataFrame,
+    ideals_fn,
     fleet_size: int = 110,
     daily_energy_budget_kwh: float | None = None,
-) -> tuple[list[HourPlan], dict]:
+    enforce_energy: bool = True,
+    peak_floor: bool = True,
+) -> tuple[dict[tuple[str, int], int], dict]:
     """
-    Hour-by-hour EV-aware frequency optimiser.
+    Allocate (route, hour) → frequency under concurrent fleet (+ optional energy).
 
-    For each hour (chronological):
-      1. Ideal frequency from predicted demand (~75% target load).
-      2. Buses required ≈ frequency × one-way cycle hours (continuous loop).
-      3. If fleet or remaining daily energy is tight, cut lowest-demand
-         routes first (protect peaks / busy corridors).
-
-    Objective: match supply to demand (boost peaks, trim empty off-peak)
-    under battery energy + concurrent fleet limits.
+    ideals_fn(row, hour) → desired trips/hr before capping.
+    Cuts lowest-demand routes first when the fleet is tight.
     """
     route_meta = {r[0]: r for r in ROUTES}
     usable_kwh = EV.battery_kwh * (1.0 - EV.min_soc)
     if daily_energy_budget_kwh is None:
-        # Overnight full charge + ~90 min opportunity / midday top-up per bus
         daily_energy_budget_kwh = fleet_size * (usable_kwh + EV.charge_kw * 1.5)
 
-    energy_remaining = float(daily_energy_budget_kwh)
+    energy_remaining = float(daily_energy_budget_kwh) if enforce_energy else float("inf")
     busy_until: list[float] = []
     assigned: dict[tuple[str, int], int] = {}
     peak_buses = 0
@@ -405,7 +462,7 @@ def optimise_frequencies(
 
     for hour in HOURS:
         busy_until = [t for t in busy_until if t > hour]
-        available = fleet_size - len(busy_until)
+        available = max(0, fleet_size - len(busy_until))
 
         hour_rows = sorted(
             rows_by_hour[hour],
@@ -414,13 +471,9 @@ def optimise_frequencies(
         )
         ideals: list[tuple[pd.Series, int, float, float]] = []
         for row in hour_rows:
-            demand = int(row["pred_passengers"])
             travel = float(row["pred_travel_min"])
             length_km = route_meta[row["route_id"]][1]
-            need = trips_from_demand(demand, EV.bus_capacity)
-            # Peak: never fall below fixed-timetable floor (reliability)
-            if is_peak_hour(hour):
-                need = max(need, baseline_frequency(hour))
+            need = int(ideals_fn(row, hour))
             cycle_h = (travel * 1.10) / 60.0
             e_trip = length_km * EV.energy_kwh_per_km * 1.05
             ideals.append((row, need, cycle_h, e_trip))
@@ -428,40 +481,242 @@ def optimise_frequencies(
         freqs = [need for _, need, _, _ in ideals]
 
         def buses_for(freq_list: list[int]) -> int:
-            total = 0
-            for (_, _, cycle_h, _), freq in zip(ideals, freq_list):
-                total += max(1, int(np.ceil(freq * cycle_h)))
-            return total
+            return sum(
+                _buses_for_freq(freq, cycle_h)
+                for (_, _, cycle_h, _), freq in zip(ideals, freq_list)
+            )
 
         def energy_for(freq_list: list[int]) -> float:
             return sum(f * e for (_, _, _, e), f in zip(ideals, freq_list))
 
         while True:
-            if buses_for(freqs) <= available and energy_for(freqs) <= energy_remaining:
+            over_fleet = buses_for(freqs) > available
+            over_energy = energy_for(freqs) > energy_remaining
+            if not over_fleet and not over_energy:
                 break
             cut_idx = None
-            for i in range(len(freqs) - 1, -1, -1):
-                floor = baseline_frequency(hour) if is_peak_hour(hour) else 1
-                if freqs[i] > floor:
-                    cut_idx = i
-                    break
+            if peak_floor and is_peak_hour(hour):
+                floor = baseline_frequency(hour)
+                for i in range(len(freqs) - 1, -1, -1):
+                    if freqs[i] > floor:
+                        cut_idx = i
+                        break
             if cut_idx is None:
                 for i in range(len(freqs) - 1, -1, -1):
-                    if freqs[i] > 1:
+                    if freqs[i] > 0:
                         cut_idx = i
                         break
             if cut_idx is None:
                 break
             freqs[cut_idx] -= 1
 
+        # If still over after cutting to zero on some routes, drop more zeros already handled.
+        # Claim buses only for what we actually dispatch; never exceed remaining slots.
+        claimed = 0
         for (row, _need, cycle_h, e_trip), freq in zip(ideals, freqs):
+            n_buses = _buses_for_freq(freq, cycle_h)
+            if claimed + n_buses > available:
+                # Scale this route down until it fits (or shut it for the hour).
+                while freq > 0 and claimed + _buses_for_freq(freq, cycle_h) > available:
+                    freq -= 1
+                n_buses = _buses_for_freq(freq, cycle_h)
             assigned[(row["route_id"], hour)] = freq
             energy_used += freq * e_trip
             energy_remaining -= freq * e_trip
-            n_buses = max(1, int(np.ceil(freq * cycle_h)))
-            release = hour + cycle_h
-            busy_until.extend([release] * n_buses)
-        peak_buses = max(peak_buses, len(busy_until))
+            if n_buses:
+                release = hour + cycle_h
+                busy_until.extend([release] * n_buses)
+                claimed += n_buses
+        peak_buses = max(peak_buses, min(fleet_size, len(busy_until)))
+
+    summary = {
+        "fleet_size": fleet_size,
+        "energy_budget_kwh": daily_energy_budget_kwh,
+        "energy_used_kwh": energy_used,
+        "energy_utilisation": (
+            energy_used / daily_energy_budget_kwh if daily_energy_budget_kwh else 0.0
+        ),
+        "peak_buses_in_use": peak_buses,
+    }
+    return assigned, summary
+
+
+def published_fixed_schedule(
+    forecast: pd.DataFrame,
+) -> tuple[dict[tuple[str, int], int], int]:
+    """
+    Full Fixed published timetable and the fleet both modes share.
+
+    Fleet = max over hours of concurrent buses needed that hour if every
+    corridor runs baseline_frequency(hour). (Peak-hour fleet formula —
+    same vehicle pool for Fixed and AI.)
+    """
+    assigned: dict[tuple[str, int], int] = {}
+    peak_buses = 0
+
+    rows_by_hour: dict[int, list[pd.Series]] = {h: [] for h in HOURS}
+    for _, row in forecast.iterrows():
+        rows_by_hour[int(row["hour"])].append(row)
+
+    for hour in HOURS:
+        hour_buses = 0
+        for row in rows_by_hour[hour]:
+            freq = baseline_frequency(hour)
+            cycle_h = (float(row["pred_travel_min"]) * 1.10) / 60.0
+            assigned[(row["route_id"], hour)] = freq
+            hour_buses += _buses_for_freq(freq, cycle_h)
+        peak_buses = max(peak_buses, hour_buses)
+
+    return assigned, max(1, peak_buses)
+
+
+def fixed_timetable_under_fleet(
+    forecast: pd.DataFrame, fleet_size: int = 110
+) -> dict[tuple[str, int], int]:
+    """Published Fixed frequencies, cut if fleet is below the Fixed requirement."""
+
+    def ideals_fn(row: pd.Series, hour: int) -> int:
+        return baseline_frequency(hour)
+
+    assigned, _ = allocate_frequencies(
+        forecast,
+        ideals_fn,
+        fleet_size=fleet_size,
+        enforce_energy=False,
+        peak_floor=False,
+    )
+    return assigned
+
+
+def optimise_frequencies(
+    forecast: pd.DataFrame,
+    fleet_size: int | None = None,
+    daily_energy_budget_kwh: float | None = None,
+) -> tuple[list[HourPlan], dict]:
+    """
+    AI+EV plan with the same bus pool as Fixed.
+
+    Fleet size comes from the Fixed published timetable (peak concurrent buses).
+    Each hour starts at Fixed headways, then AI redeploys trips from low-load
+    corridors to high-load ones — and can use spare buses that Fixed leaves
+    idle off-peak — without ever exceeding that Fixed fleet.
+
+    Efficiency = better allocation of the *same* vehicles.
+    """
+    fixed_freqs, fixed_fleet = published_fixed_schedule(forecast)
+    if fleet_size is None:
+        fleet_size = fixed_fleet
+
+    route_meta = {r[0]: r for r in ROUTES}
+    usable_kwh = EV.battery_kwh * (1.0 - EV.min_soc)
+    if daily_energy_budget_kwh is None:
+        daily_energy_budget_kwh = fleet_size * (usable_kwh + EV.charge_kw * 1.5)
+
+    rows_by_hour: dict[int, list[pd.Series]] = {h: [] for h in HOURS}
+    for _, row in forecast.iterrows():
+        rows_by_hour[int(row["hour"])].append(row)
+
+    assigned: dict[tuple[str, int], int] = {}
+    peak_buses = 0
+    energy_used = 0.0
+    redeploy_moves = 0
+    spare_boosts = 0
+    max_freq = 24
+    min_freq = 1
+
+    for hour in HOURS:
+        entries: list[dict] = []
+        for row in rows_by_hour[hour]:
+            rid = row["route_id"]
+            cycle_h = (float(row["pred_travel_min"]) * 1.10) / 60.0
+            length_km = route_meta[rid][1]
+            entries.append(
+                {
+                    "route_id": rid,
+                    "demand": int(row["pred_passengers"]),
+                    "cycle_h": cycle_h,
+                    "e_trip": length_km * EV.energy_kwh_per_km * 1.05,
+                    "freq": int(fixed_freqs.get((rid, hour), baseline_frequency(hour))),
+                }
+            )
+
+        def buses_needed(items: list[dict] = entries) -> int:
+            return sum(_buses_for_freq(e["freq"], e["cycle_h"]) for e in items)
+
+        def load_of(e: dict) -> float:
+            seats = max(e["freq"], 1) * EV.bus_capacity
+            return e["demand"] / seats
+
+        def unserved_of(e: dict) -> int:
+            return max(0, e["demand"] - e["freq"] * EV.bus_capacity)
+
+        available = fleet_size  # same pool every hour; Fixed often under-uses off-peak
+
+        # 1) Use spare fleet: add trips to the busiest corridor while buses remain
+        for _ in range(80):
+            if buses_needed() >= available:
+                break
+            receiver = max(entries, key=lambda e: (unserved_of(e), load_of(e), e["demand"]))
+            if unserved_of(receiver) <= 0 and load_of(receiver) <= 0.85:
+                break
+            if receiver["freq"] >= max_freq:
+                break
+            receiver["freq"] += 1
+            if buses_needed() > available:
+                receiver["freq"] -= 1
+                break
+            spare_boosts += 1
+            redeploy_moves += 1
+
+        # 2) Rebalance: move one trip/hr from lowest load → highest load / most unserved
+        for _ in range(120):
+            if len(entries) < 2:
+                break
+            receiver = max(entries, key=lambda e: (unserved_of(e), load_of(e), e["demand"]))
+            donors = [
+                e
+                for e in entries
+                if e["route_id"] != receiver["route_id"] and e["freq"] > min_freq
+            ]
+            if not donors:
+                break
+            # Prefer donors with spare capacity; else least-busy overloaded
+            spare_donors = [e for e in donors if unserved_of(e) == 0]
+            donor = min(
+                spare_donors or donors,
+                key=lambda e: (load_of(e), e["demand"], -e["freq"]),
+            )
+            # Stop when loads/unserved are already as balanced as discrete freqs allow
+            if unserved_of(receiver) <= unserved_of(donor) and load_of(receiver) <= load_of(
+                donor
+            ) + 0.08:
+                break
+            if receiver["freq"] >= max_freq:
+                break
+
+            receiver["freq"] += 1
+            donor["freq"] -= 1
+            if buses_needed() > available:
+                receiver["freq"] -= 1
+                donor["freq"] += 1
+                # Try sacrificing two donor trips if receiver cycle is longer
+                if donor["freq"] > min_freq:
+                    donor["freq"] -= 1
+                    receiver["freq"] += 1
+                    if buses_needed() > available:
+                        donor["freq"] += 1
+                        receiver["freq"] -= 1
+                        break
+                else:
+                    break
+            redeploy_moves += 1
+
+        hour_peak = buses_needed()
+        peak_buses = max(peak_buses, hour_peak)
+
+        for e in entries:
+            assigned[(e["route_id"], hour)] = e["freq"]
+            energy_used += e["freq"] * e["e_trip"]
 
     plans: list[HourPlan] = []
     for _, row in forecast.sort_values(["route_id", "hour"]).iterrows():
@@ -470,15 +725,15 @@ def optimise_frequencies(
         demand = int(row["pred_passengers"])
         travel = float(row["pred_travel_min"])
         length_km = route_meta[route_id][1]
-        freq = assigned[(route_id, hour)]
+        freq = assigned.get((route_id, hour), baseline_frequency(hour))
         energy = freq * length_km * EV.energy_kwh_per_km * 1.05
-        seats = freq * EV.bus_capacity
+        seats = max(freq, 0) * EV.bus_capacity
         load = demand / seats if seats else 0.0
         plans.append(
             HourPlan(
                 route_id=route_id,
                 hour=hour,
-                frequency_per_hour=freq,
+                frequency_per_hour=max(freq, 0),
                 predicted_demand=demand,
                 travel_min=travel,
                 trips_needed_by_demand=trips_from_demand(demand, EV.bus_capacity),
@@ -489,10 +744,16 @@ def optimise_frequencies(
 
     summary = {
         "fleet_size": fleet_size,
+        "fleet_from_fixed": fixed_fleet,
+        "fleet_source": "Fixed published timetable (peak concurrent buses)",
         "energy_budget_kwh": daily_energy_budget_kwh,
         "energy_used_kwh": energy_used,
-        "energy_utilisation": energy_used / daily_energy_budget_kwh,
+        "energy_utilisation": (
+            energy_used / daily_energy_budget_kwh if daily_energy_budget_kwh else 0.0
+        ),
         "peak_buses_in_use": peak_buses,
+        "redeploy_moves": redeploy_moves,
+        "spare_boosts": spare_boosts,
         "avg_load_factor": float(np.mean([p.load_factor for p in plans])),
         "total_vehicle_trips": sum(p.frequency_per_hour for p in plans),
     }
@@ -505,23 +766,54 @@ def optimise_frequencies(
 
 @dataclass
 class BusinessAssumptions:
-    electricity_thb_per_kwh: float = 4.2
-    diesel_thb_per_litre: float = 33.0
+    # Defaults overwritten below from data.thai_assumptions (official Thai sources)
+    electricity_thb_per_kwh: float = 2.766
+    diesel_thb_per_litre: float = 34.94
     driver_thb_per_hour: float = 120.0
     diesel_co2_kg_per_l: float = 2.68
-    grid_co2_kg_per_kwh: float = 0.42  # Thailand grid approx.
+    grid_co2_kg_per_kwh: float = 0.4758
     # Unserved demand converts to lost ridership; better wait time wins riders
     elasticity_wait_time: float = -0.25  # % ridership per % wait change
     fare_capture_rate: float = 0.92  # paid boardings
 
 
-BIZ = BusinessAssumptions()
+try:
+    from data.thai_assumptions import (
+        ASSUMPTION_SOURCES,
+        DIESEL_CO2_KG_PER_LITRE,
+        DIESEL_THB_PER_LITRE,
+        ELECTRICITY_THB_PER_KWH,
+        GRID_CO2_KG_PER_KWH,
+    )
+
+    BIZ = BusinessAssumptions(
+        electricity_thb_per_kwh=ELECTRICITY_THB_PER_KWH,
+        diesel_thb_per_litre=DIESEL_THB_PER_LITRE,
+        diesel_co2_kg_per_l=DIESEL_CO2_KG_PER_LITRE,
+        grid_co2_kg_per_kwh=GRID_CO2_KG_PER_KWH,
+    )
+except Exception:
+    ASSUMPTION_SOURCES = {}
+    BIZ = BusinessAssumptions()
 
 
-def business_comparison(forecast: pd.DataFrame, plans: list[HourPlan]) -> dict:
-    opt_freq = {(p.route_id, p.hour): p.frequency_per_hour for p in plans}
+def business_comparison(
+    forecast: pd.DataFrame,
+    plans: list[HourPlan],
+    fleet_size: int | None = None,
+    fixed_freqs: dict[tuple[str, int], int] | None = None,
+) -> dict:
+    """Compare diesel Fixed vs EV+AI under the same Fixed-derived fleet."""
+    pub_fixed, fixed_fleet = published_fixed_schedule(forecast)
+    if fleet_size is None:
+        fleet_size = fixed_fleet
+    if fixed_freqs is None:
+        # Fleet is sized for Fixed → run the full published timetable
+        fixed_freqs = pub_fixed if fleet_size >= fixed_fleet else fixed_timetable_under_fleet(
+            forecast, fleet_size=fleet_size
+        )
 
-    # Baseline: diesel fixed timetable
+    # Baseline: diesel + Fixed published timetable (same bus pool AI must share)
     base = {
         "vehicle_km": 0.0,
         "diesel_l": 0.0,
@@ -540,12 +832,12 @@ def business_comparison(forecast: pd.DataFrame, plans: list[HourPlan]) -> dict:
         demand = int(row["pred_passengers"])
         travel = float(row["pred_travel_min"])
         length_km, _, _, fare, diesel_rate = route_meta[rid][1:]
-        freq = baseline_frequency(hour)
+        freq = max(0, int(fixed_freqs.get((rid, hour), baseline_frequency(hour))))
         cap = freq * EV.bus_capacity
         boarded = min(demand, cap)
         base["served"] += boarded
         base["unserved"] += max(0, demand - cap)
-        wait = (60.0 / freq) / 2.0
+        wait = (60.0 / max(freq, 1)) / 2.0 if freq > 0 else 45.0
         base["wait_sum"] += wait * demand  # demand-weighted wait
         base["demand_w"] += demand
         base["vehicle_km"] += freq * length_km
@@ -572,18 +864,19 @@ def business_comparison(forecast: pd.DataFrame, plans: list[HourPlan]) -> dict:
         boarded = min(p.predicted_demand, cap)
         opt["served"] += boarded
         opt["unserved"] += max(0, p.predicted_demand - cap)
-        wait = (60.0 / max(p.frequency_per_hour, 1)) / 2.0
+        freq = max(p.frequency_per_hour, 0)
+        wait = (60.0 / max(freq, 1)) / 2.0 if freq > 0 else 45.0
         opt["wait_sum"] += wait * p.predicted_demand
         opt["demand_w"] += p.predicted_demand
-        opt["vehicle_km"] += p.frequency_per_hour * length_km
+        opt["vehicle_km"] += freq * length_km
         opt["energy_kwh"] += p.energy_kwh
-        opt["driver_hours"] += p.frequency_per_hour * (p.travel_min * 1.15) / 60.0
+        opt["driver_hours"] += freq * (p.travel_min * 1.15) / 60.0
         opt["revenue"] += boarded * fare * BIZ.fare_capture_rate
-        opt["trips"] += p.frequency_per_hour
+        opt["trips"] += freq
 
     base_wait = base["wait_sum"] / max(base["demand_w"], 1)
     opt_wait = opt["wait_sum"] / max(opt["demand_w"], 1)
-    wait_pct_change = (opt_wait - base_wait) / base_wait
+    wait_pct_change = (opt_wait - base_wait) / max(base_wait, 1e-6)
     # Ridership response to wait-time change (elasticity can raise or lower)
     induced = opt["served"] * BIZ.elasticity_wait_time * wait_pct_change
     opt_ridership = max(opt["served"] + induced, opt["served"] * 0.95)
@@ -601,13 +894,13 @@ def business_comparison(forecast: pd.DataFrame, plans: list[HourPlan]) -> dict:
     opt_co2 = opt["energy_kwh"] * BIZ.grid_co2_kg_per_kwh
 
     # Fleet utilisation: trips per available bus-hour slot
-    fleet = 110
+    fleet = max(fleet_size, 1)
     base_util = base["trips"] / (fleet * len(HOURS))
     opt_util = opt["trips"] / (fleet * len(HOURS))
 
     return {
         "baseline": {
-            "mode": "Diesel + fixed timetable",
+            "mode": "Diesel + Fixed published timetable",
             "vehicle_km": round(base["vehicle_km"], 1),
             "fuel_or_energy_cost_thb": round(
                 base["diesel_l"] * BIZ.diesel_thb_per_litre, 0
@@ -714,13 +1007,16 @@ def main() -> None:
         f"{EV.energy_kwh_per_km} kWh/km, min SOC {EV.min_soc:.0%}, "
         f"capacity {EV.bus_capacity}"
     )
-    plans, opt_sum = optimise_frequencies(forecast, fleet_size=110)
+    plans, opt_sum = optimise_frequencies(forecast)
     print(
         f"Energy used: {opt_sum['energy_used_kwh']:.0f} / "
         f"{opt_sum['energy_budget_kwh']:.0f} kWh "
         f"({opt_sum['energy_utilisation']:.1%} of daily budget)"
     )
-    print(f"Peak buses in simultaneous use: {opt_sum['peak_buses_in_use']} / 110")
+    print(
+        f"Fleet from Fixed timetable: {opt_sum['fleet_from_fixed']} buses · "
+        f"AI peak in use: {opt_sum['peak_buses_in_use']} / {opt_sum['fleet_size']}"
+    )
     print(f"Average load factor: {opt_sum['avg_load_factor']:.2f}")
     print(f"Total vehicle-trips scheduled: {opt_sum['total_vehicle_trips']}")
 

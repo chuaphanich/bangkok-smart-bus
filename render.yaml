@@ -1,0 +1,19 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Deploy: connect this repo in the Render dashboard, or:
+#   render blueprint apply
+services:
+  - type: web
+    name: bangkok-smart-bus
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements_bangkok_bus.txt
+    startCommand: gunicorn -b 0.0.0.0:$PORT -w 1 --timeout 180 --access-logfile - app:app
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.4"
+      # Optional — leave unset to use heuristic traffic
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
+      - key: ORS_API_KEY
+        sync: false

@@ -1,12 +1,19 @@
 """
 Bangkok Smart Bus — web dashboard
-Run:  .venv_bangkok/bin/python app.py
-Then open http://127.0.0.1:5050
+
+Local:
+    .venv_bangkok/bin/python app.py
+    → http://127.0.0.1:5050
+
+Production (Render / Docker):
+    gunicorn -b 0.0.0.0:$PORT -w 1 --timeout 120 app:app
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict
+from math import ceil
 from typing import Any
 
 from flask import Flask, jsonify, render_template, request
@@ -28,9 +35,19 @@ def _bootstrap() -> None:
         ok = bb.load_real_network()
         if not ok:
             print("Warning: real network unavailable — synthetic fallback.")
-        hist = bb.generate_historical_data(60)
-        models = bb.train_models(hist)
-        _state["models"] = models
+
+        cached = bb.load_models()
+        if cached is not None:
+            print("Loaded trained models from cache.")
+            _state["models"] = cached
+        else:
+            print("Training demand & travel models…")
+            hist = bb.generate_historical_data(60)
+            models = bb.train_models(hist)
+            bb.save_models(models)
+            print(f"Models saved → {bb.MODELS_CACHE}")
+            _state["models"] = models
+
         _state["ready"] = True
         print(f"Ready. Data mode={bb.DATA_SOURCES.get('mode')}")
     except Exception as exc:  # noqa: BLE001 — surface to UI
@@ -89,15 +106,19 @@ def _route_meta() -> list[dict[str, Any]]:
 def _run_optimisation(
     day_of_week: int = 1,
     rain: float = 0.0,
-    fleet_size: int = 110,
 ) -> dict[str, Any]:
     models = _state["models"]
     if models is None:
         raise RuntimeError("Models not ready")
 
     forecast = bb.predict_horizon(models, day_of_week=day_of_week, rain=rain)
+    # Fleet size comes from Fixed published headways × predicted cycle times.
+    # AI gets the same number of buses and must win by reallocating them.
+    fixed_freqs, fleet_size = bb.published_fixed_schedule(forecast)
     plans, opt_sum = bb.optimise_frequencies(forecast, fleet_size=fleet_size)
-    biz = bb.business_comparison(forecast, plans)
+    biz = bb.business_comparison(
+        forecast, plans, fleet_size=fleet_size, fixed_freqs=fixed_freqs
+    )
 
     by_route = (
         forecast.groupby("route_id")
@@ -140,15 +161,47 @@ def _run_optimisation(
         },
     ]
 
+    def _buses_at(freq: int, travel_min: float) -> int:
+        if freq <= 0:
+            return 0
+        cycle_h = (float(travel_min) * 1.10) / 60.0
+        return max(1, int(ceil(freq * cycle_h)))
+
     hourly = []
     for p in plans:
+        fx = int(fixed_freqs.get((p.route_id, p.hour), bb.baseline_frequency(p.hour)))
         hourly.append(
             {
                 **asdict(p),
-                "fixed_frequency": bb.baseline_frequency(p.hour),
+                "fixed_frequency": fx,
+                "published_frequency": bb.baseline_frequency(p.hour),
                 "is_peak": bb.is_peak_hour(p.hour),
+                "ai_buses": _buses_at(p.frequency_per_hour, p.travel_min),
+                "fixed_buses": _buses_at(fx, p.travel_min),
             }
         )
+
+    # Peak-hour fleet is the daily depot size; in-use varies by hour
+    buses_by_hour: dict[int, dict[str, int]] = {}
+    for h in bb.HOURS:
+        rows = [r for r in hourly if r["hour"] == h]
+        buses_by_hour[h] = {
+            "fixed": sum(r["fixed_buses"] for r in rows),
+            "ai": sum(r["ai_buses"] for r in rows),
+        }
+    opt_sum = dict(opt_sum)
+    opt_sum["buses_by_hour"] = buses_by_hour
+
+    from data.stop_wait import attach_stop_waits
+
+    route_meta = _route_meta()
+    hourly, stop_meta = attach_stop_waits(
+        route_meta, hourly, day_of_week=day_of_week, rain=rain
+    )
+    data_sources = dict(bb.DATA_SOURCES)
+    data_sources["stop_wait"] = (
+        f"Per-stop wait from corridor traffic ({stop_meta.get('stop_traffic_source')})"
+    )
 
     forecast_rows = forecast.to_dict(orient="records")
     s = biz["savings_per_day"]
@@ -160,7 +213,7 @@ def _run_optimisation(
     }
 
     return {
-        "routes": _route_meta(),
+        "routes": route_meta,
         "hours": bb.HOURS,
         "forecast": forecast_rows,
         "plans": hourly,
@@ -178,9 +231,12 @@ def _run_optimisation(
             "day_of_week": day_of_week,
             "rain": rain,
             "fleet_size": fleet_size,
+            "fleet_source": "Fixed published timetable",
         },
         "ev": asdict(bb.EV),
-        "data_sources": bb.DATA_SOURCES,
+        "data_sources": data_sources,
+        "stop_wait_meta": stop_meta,
+        "assumptions": getattr(bb, "ASSUMPTION_SOURCES", {}),
     }
 
 
@@ -207,23 +263,25 @@ def optimise():
 
     day = int(request.args.get("day_of_week", 1))
     rain = float(request.args.get("rain", 0.0))
-    fleet = int(request.args.get("fleet_size", 110))
     day = max(0, min(6, day))
     rain = 1.0 if rain >= 0.5 else 0.0
-    fleet = max(40, min(200, fleet))
 
     try:
-        payload = _run_optimisation(day_of_week=day, rain=rain, fleet_size=fleet)
+        payload = _run_optimisation(day_of_week=day, rain=rain)
         return jsonify(payload)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 500
 
 
+# Bootstrap when imported by Gunicorn (production) or run via __main__
+_bootstrap()
+
+
 if __name__ == "__main__":
-    print("Bootstrapping Bangkok Smart Bus…")
-    _bootstrap()
+    port = int(os.environ.get("PORT", "5050"))
+    host = os.environ.get("HOST", "127.0.0.1")
     if _state["ready"]:
-        print("Models ready. Open http://127.0.0.1:5050")
+        print(f"Models ready. Open http://{host}:{port}")
     else:
         print("Bootstrap failed:", _state["error"])
-    app.run(host="127.0.0.1", port=5050, debug=False)
+    app.run(host=host, port=port, debug=False)
